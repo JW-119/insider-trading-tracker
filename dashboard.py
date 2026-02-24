@@ -151,6 +151,18 @@ if "total_value" in df.columns:
 if "filing_date" in df.columns:
     df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
 
+# 날짜 내림차순 → 거래금액 내림차순 정렬
+sort_cols = []
+sort_asc = []
+if "filing_date" in df.columns:
+    sort_cols.append("filing_date")
+    sort_asc.append(False)
+if "total_value" in df.columns:
+    sort_cols.append("total_value")
+    sort_asc.append(False)
+if sort_cols:
+    df = df.sort_values(sort_cols, ascending=sort_asc, na_position="last").reset_index(drop=True)
+
 # --- 사이드바 필터 ---
 st.sidebar.header("🔍 필터")
 
