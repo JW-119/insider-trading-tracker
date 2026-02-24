@@ -2,11 +2,15 @@
 
 import json
 import os
+import re
 import time
 
 import requests
 
 import config
+
+# EFTS (EDGAR Full-Text Search) 엔드포인트
+EFTS_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 
 
 def _get_session() -> requests.Session:
@@ -197,6 +201,171 @@ def collect_insider_trades(
             print(f"[Scraper] Latest 모드 검색 실패: {e}")
             print("[Scraper] Watchlist 모드로 전환합니다.")
             return collect_insider_trades(tickers=tickers, mode="watchlist")
+
+    print(f"[Scraper] 총 {len(all_trades)}건의 거래 데이터 수집 완료")
+    return all_trades
+
+
+def _extract_ticker_from_display_name(name: str) -> str:
+    """display_names에서 티커 심볼 추출.
+
+    예: "Apple Inc.  (AAPL)  (CIK 0000320193)" → "AAPL"
+    """
+    match = re.search(r"\(([A-Z]{1,5})\)", name)
+    return match.group(1) if match else ""
+
+
+def search_form4_filings_by_date(
+    start_date: str,
+    end_date: str,
+    max_filings: int = 200,
+    progress_callback=None,
+) -> list[dict]:
+    """EFTS API로 날짜 범위의 모든 Form 4 filing 메타데이터를 검색.
+
+    Args:
+        start_date: 시작일 (YYYY-MM-DD)
+        end_date: 종료일 (YYYY-MM-DD)
+        max_filings: 최대 filing 수
+        progress_callback: 진행률 콜백 (current, total)
+
+    Returns:
+        [{"url": ..., "ticker": ..., "company": ..., "filing_date": ..., "accession": ...}, ...]
+    """
+    session = _get_session()
+    all_hits = []
+    offset = 0
+
+    # 1단계: EFTS 검색으로 filing 메타데이터 수집
+    while offset < max_filings:
+        size = min(100, max_filings - offset)
+        params = {
+            "forms": "4",
+            "startdt": start_date,
+            "enddt": end_date,
+            "from": offset,
+            "size": size,
+        }
+
+        try:
+            resp = session.get(
+                EFTS_SEARCH_URL, params=params, timeout=config.REQUEST_TIMEOUT
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            print(f"[Scraper] EFTS 검색 실패 (offset={offset}): {e}")
+            break
+
+        hits = data.get("hits", {}).get("hits", [])
+        total = data.get("hits", {}).get("total", {}).get("value", 0)
+
+        if not hits:
+            break
+
+        all_hits.extend(hits)
+        print(f"[Scraper] EFTS 검색: {len(all_hits)}/{min(total, max_filings)}건 수집")
+
+        if offset + len(hits) >= total:
+            break
+
+        offset += len(hits)
+        time.sleep(config.REQUEST_DELAY)
+
+    print(f"[Scraper] 총 {len(all_hits)}건의 Form 4 filing 발견")
+
+    # 2단계: 각 filing에서 메타데이터 추출 + URL 구성
+    filings = []
+    for hit in all_hits:
+        _id = hit.get("_id", "")
+        src = hit.get("_source", {})
+
+        if ":" not in _id:
+            continue
+
+        accession, filename = _id.split(":", 1)
+        accession_nodash = accession.replace("-", "")
+        ciks = src.get("ciks", [])
+        if not ciks:
+            continue
+
+        cik = ciks[0].lstrip("0")
+        xml_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{filename}"
+
+        # 회사명/티커 추출
+        display_names = src.get("display_names", [])
+        company = ""
+        ticker = ""
+        if len(display_names) >= 2:
+            company_raw = display_names[1]
+            ticker = _extract_ticker_from_display_name(company_raw)
+            # CIK 부분 제거하여 회사명 정리
+            company = re.sub(r"\s*\(CIK\s+\d+\)\s*$", "", company_raw)
+            company = re.sub(r"\s*\(" + re.escape(ticker) + r"\)\s*", " ", company).strip() if ticker else company
+
+        filings.append({
+            "url": xml_url,
+            "ticker": ticker,
+            "company": company,
+            "filing_date": src.get("file_date", ""),
+            "accession": accession,
+        })
+
+    return filings
+
+
+def collect_all_form4_by_date(
+    start_date: str,
+    end_date: str,
+    max_filings: int = 200,
+    progress_callback=None,
+) -> list[dict]:
+    """날짜 범위의 모든 Form 4 거래를 수집.
+
+    Args:
+        start_date: 시작일 (YYYY-MM-DD)
+        end_date: 종료일 (YYYY-MM-DD)
+        max_filings: 최대 filing 수
+        progress_callback: 진행률 콜백 (current, total) — Streamlit progress bar용
+
+    Returns:
+        파싱된 거래 목록
+    """
+    from parser import parse_form4_xml
+
+    session = _get_session()
+
+    # 1단계: filing 메타데이터 검색
+    filings = search_form4_filings_by_date(start_date, end_date, max_filings)
+
+    if not filings:
+        print("[Scraper] 해당 날짜에 Form 4 filing이 없습니다.")
+        return []
+
+    # 2단계: 각 filing의 XML 다운로드 + 파싱
+    all_trades = []
+    total = len(filings)
+
+    for i, filing in enumerate(filings):
+        if progress_callback:
+            progress_callback(i, total)
+
+        time.sleep(config.REQUEST_DELAY)
+        xml = fetch_form4_xml(session, filing["url"])
+        if xml is None:
+            continue
+
+        trades = parse_form4_xml(xml, filing["url"])
+        for trade in trades:
+            if not trade.get("ticker") and filing["ticker"]:
+                trade["ticker"] = filing["ticker"]
+            if not trade.get("company") and filing["company"]:
+                trade["company"] = filing["company"]
+            trade["filing_date"] = filing["filing_date"]
+        all_trades.extend(trades)
+
+    if progress_callback:
+        progress_callback(total, total)
 
     print(f"[Scraper] 총 {len(all_trades)}건의 거래 데이터 수집 완료")
     return all_trades

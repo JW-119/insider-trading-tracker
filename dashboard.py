@@ -6,6 +6,7 @@ Usage:
 
 import os
 import glob
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
@@ -25,13 +26,6 @@ def _format_metric(value: float) -> str:
     return f"${value:,.0f}"
 
 
-def _is_cloud() -> bool:
-    """Streamlit Cloud 환경인지 판별."""
-    # data/ 폴더에 엑셀 파일이 없으면 클라우드로 간주
-    pattern = os.path.join(config.DATA_DIR, "insider-trades-*.xlsx")
-    return len(glob.glob(pattern)) == 0
-
-
 # --- 페이지 설정 ---
 st.set_page_config(
     page_title="Insider Trading Tracker",
@@ -43,7 +37,32 @@ st.title("📊 Insider Trading Tracker")
 st.caption("SEC Form 4 내부자 거래 데이터 대시보드")
 
 
-# --- 데이터 로드 (로컬 모드) ---
+# --- 실시간 데이터 수집 ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data_by_date(start_date: str, end_date: str, max_filings: int) -> pd.DataFrame:
+    """SEC EDGAR에서 날짜 범위의 모든 Form 4 데이터를 수집."""
+    from scraper import collect_all_form4_by_date
+
+    raw_trades = collect_all_form4_by_date(
+        start_date=start_date,
+        end_date=end_date,
+        max_filings=max_filings,
+    )
+
+    if not raw_trades:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(raw_trades)
+
+    # 컬럼명을 COLUMN_NAMES의 key 형식으로 통일
+    for col in config.COLUMN_NAMES:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df
+
+
+# --- 로컬 데이터 로드 (엑셀 파일이 있는 경우) ---
 @st.cache_data
 def load_data_local() -> pd.DataFrame:
     """data/ 폴더의 모든 엑셀 파일을 로드하여 병합."""
@@ -69,68 +88,61 @@ def load_data_local() -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-# --- 데이터 로드 (클라우드 모드: 실시간 수집) ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data_live(tickers_csv: str, max_filings: int) -> pd.DataFrame:
-    """SEC EDGAR에서 실시간으로 Form 4 데이터를 수집."""
-    from scraper import collect_insider_trades
+# --- 사이드바: 데이터 수집 설정 ---
+st.sidebar.header("⚙️ 데이터 수집")
 
-    tickers = [t.strip().upper() for t in tickers_csv.split(",") if t.strip()]
-    if not tickers:
-        return pd.DataFrame()
+# 로컬 엑셀 파일 존재 여부 확인
+has_local_data = len(glob.glob(os.path.join(config.DATA_DIR, "insider-trades-*.xlsx"))) > 0
 
-    raw_trades = collect_insider_trades(
-        tickers=tickers,
-        mode="watchlist",
-        max_filings_per_ticker=max_filings,
+if has_local_data:
+    data_source = st.sidebar.radio(
+        "데이터 소스",
+        ["SEC EDGAR 실시간 수집", "로컬 Excel 파일"],
+        index=0,
     )
+else:
+    data_source = "SEC EDGAR 실시간 수집"
 
-    if not raw_trades:
-        return pd.DataFrame()
+if data_source == "SEC EDGAR 실시간 수집":
+    # 날짜 범위 선택
+    today = date.today()
+    # 주말이면 가장 최근 영업일로 기본값 설정
+    default_end = today
+    if today.weekday() == 5:  # 토요일
+        default_end = today - timedelta(days=1)
+    elif today.weekday() == 6:  # 일요일
+        default_end = today - timedelta(days=2)
 
-    df = pd.DataFrame(raw_trades)
+    default_start = default_end - timedelta(days=4)  # 최근 5일
 
-    # 컬럼명을 COLUMN_NAMES의 key 형식으로 통일
-    expected_cols = list(config.COLUMN_NAMES.keys())
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = ""
+    col_start, col_end = st.sidebar.columns(2)
+    with col_start:
+        start_dt = st.date_input("시작일", value=default_start)
+    with col_end:
+        end_dt = st.date_input("종료일", value=default_end)
 
-    return df
-
-
-# --- 모드 분기 ---
-cloud_mode = _is_cloud()
-
-if cloud_mode:
-    # 사이드바: 종목 입력 위젯
-    st.sidebar.header("⚙️ 데이터 수집 설정")
-    default_tickers = ", ".join(config.WATCHLIST_TICKERS[:5])
-    tickers_input = st.sidebar.text_input(
-        "종목 (Ticker, 쉼표 구분)",
-        value=default_tickers,
-        help="예: AAPL, MSFT, GOOGL",
-    )
     max_filings = st.sidebar.slider(
-        "티커당 최대 Filing 수",
-        min_value=1,
-        max_value=20,
-        value=5,
+        "최대 Filing 수",
+        min_value=50,
+        max_value=500,
+        value=200,
+        step=50,
+        help="하루 평균 500~1300건의 Form 4가 있습니다",
     )
 
-    with st.spinner("SEC EDGAR에서 데이터를 수집하고 있습니다..."):
-        df = load_data_live(tickers_input, max_filings)
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = end_dt.strftime("%Y-%m-%d")
+
+    with st.spinner(f"SEC EDGAR에서 {start_str} ~ {end_str} 데이터를 수집 중..."):
+        df = load_data_by_date(start_str, end_str, max_filings)
 
     if df.empty:
-        st.warning("데이터를 수집하지 못했습니다. 종목 코드를 확인하세요.")
+        st.warning("해당 기간에 Form 4 데이터가 없습니다. 날짜를 확인하세요 (주말/공휴일 제외).")
         st.stop()
 else:
     df = load_data_local()
-
     if df.empty:
-        st.warning(
-            "데이터가 없습니다. `python main.py`를 실행하여 데이터를 먼저 수집하세요."
-        )
+        st.warning("데이터가 없습니다. `python main.py`를 실행하여 데이터를 먼저 수집하세요.")
         st.stop()
 
 # --- 데이터 전처리 ---
@@ -143,7 +155,7 @@ for col in ["shares", "price_per_share", "shares_owned_after"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# total_value 재계산 (엑셀에서 문자열로 저장된 경우)
+# total_value 재계산
 if "total_value" in df.columns:
     df["total_value"] = df["shares"].abs() * df["price_per_share"]
 
@@ -166,22 +178,6 @@ if sort_cols:
 # --- 사이드바 필터 ---
 st.sidebar.header("🔍 필터")
 
-# 날짜 범위
-if "filing_date" in df.columns and df["filing_date"].notna().any():
-    min_date = df["filing_date"].min().date()
-    max_date = df["filing_date"].max().date()
-    date_range = st.sidebar.date_input(
-        "날짜 범위",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date,
-    )
-    if len(date_range) == 2:
-        df = df[
-            (df["filing_date"].dt.date >= date_range[0])
-            & (df["filing_date"].dt.date <= date_range[1])
-        ]
-
 # 티커 필터
 if "ticker" in df.columns:
     tickers = sorted(df["ticker"].dropna().unique())
@@ -192,7 +188,10 @@ if "ticker" in df.columns:
 # 거래 유형 필터
 if "transaction_code" in df.columns:
     codes = sorted(df["transaction_code"].dropna().unique())
-    selected_codes = st.sidebar.multiselect("거래 유형", codes, default=[], format_func=lambda c: f"{c} — {config.TRANSACTION_CODES.get(c, c)}")
+    selected_codes = st.sidebar.multiselect(
+        "거래 유형", codes, default=[],
+        format_func=lambda c: f"{c} — {config.TRANSACTION_CODES.get(c, c)}",
+    )
     if selected_codes:
         df = df[df["transaction_code"].isin(selected_codes)]
 
