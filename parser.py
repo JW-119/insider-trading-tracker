@@ -1,4 +1,5 @@
 """Form 4 XML 파싱 모듈."""
+from __future__ import annotations
 
 from bs4 import BeautifulSoup
 

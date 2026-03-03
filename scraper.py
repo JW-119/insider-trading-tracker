@@ -1,4 +1,5 @@
 """SEC EDGAR Form 4 데이터 수집 모듈."""
+from __future__ import annotations
 
 import json
 import os
